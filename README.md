@@ -1,27 +1,87 @@
 Motive
 
-Motive is an intent-aware e-commerce recommendation system that shows why each item was recommended. It is built on the anonymized Retailrocket dataset and includes a Python recommendation backend, a FastAPI service, and a React frontend.
+An explainable, intent-aware e-commerce recommender that shows the evidence behind every result.
 
-Most recommenders return a ranked list and stop there. Motive keeps the evidence behind each result: which item from the shopper's history led to it, how similar the two items are, whether shoppers viewed them in the same sessions, how popular the item is, where the learned model ranked it, and whether a natural-language request moved it. When a request includes something the data cannot verify, such as a brand or a price limit, Motive says so instead of pretending it was applied.
+Most recommendation systems return a ranked list and stop there. You see what was recommended, but not why, and you have no way to check whether a request like "something different this time" actually changed anything.
 
-What Motive Does
-Recommends products using two separate retrieval signals: catalog-property similarity and behavioral co-visitation.
-Reranks candidates with a trained gradient-boosted tree model.
-Handles new, low-history, and established shoppers differently.
-Uses Anthropic's Claude to turn requests like "show me something different" into structured preferences. Claude never picks the items.
-Applies supported preferences as a bounded adjustment on top of the learned ranking.
-Flags constraints it cannot verify, such as brand, price, and use case.
-Generates explanations from recorded evidence, not generic templates.
-Ships with 37 automated tests and a 158-check product regression suite.
-An Important Note on the Data
+Motive keeps the evidence. For each recommendation, it records which item from the shopper's history led to it, how similar the two items are in catalog properties, whether shoppers tend to view them in the same sessions, how popular the item is, where the learned model ranked it, and whether a natural-language request moved it. It combines retrieval, a learned reranker, structured intent parsing, and recorded provenance into one pipeline served through FastAPI and a React interface.
 
-Retailrocket products are anonymized. Items are numeric IDs, and most catalog properties are hashed values. The dataset does not reliably tell you what a product is called, who makes it, what it costs, or what it is for.
+Motive is built on the anonymized Retailrocket dataset, and that shaped the whole design. The data does not contain real product names, brands, or prices, so Motive is careful never to pretend it does. When a request asks for something the data cannot verify, the system says so.
 
-Because of this, Motive does not show product names, brands, prices, specifications, images, or retailer links. The colored marks on recommendation cards are generated from item IDs and are not product images. If a shopper asks for "Sony headphones under $300," Motive can understand the request, but it will not claim that any result is a Sony product, costs under $300, or is a pair of headphones.
+Table of Contents
+What It Does
+Architecture
+Dataset and Cold Start
+Candidate Generation
+Learned Reranking
+Natural-Language Intent
+Explainability and Provenance
+Frontend
+Evaluation
+Performance Engineering
+Technology Stack
+Testing
+Engineering Lessons
+Current Limitations
+Future Improvements
+Getting Started
+API Reference
+Project Structure
+Project Status
+What It Does
 
-This constraint shaped most of the design. The explanations and the handling of unsupported requests exist because honest output was a requirement, not an afterthought.
+Given a shopper ID and an optional request in plain English, Motive returns a ranked list of products along with the evidence for each one.
 
-Dataset
+A known shopper's recommendations come from two retrieval signals, catalog-property similarity and behavioral co-visitation, which are then reranked by a trained gradient-boosted tree model. A new shopper with no history gets weighted popularity instead. If the shopper types a request, Claude converts it into a structured intent object, and Motive applies the supported parts of that intent as a small, bounded adjustment to the learned ranking.
+
+Every result carries its provenance: the source history item, similarity and co-visitation scores, support counts, popularity, base rank, final rank, and any part of the request that could not be verified. Explanations are generated from that evidence rather than from generic templates.
+
+The project includes a Python recommendation backend, a FastAPI service, a React and Vite frontend, 37 automated tests, and a 158-check product regression suite.
+
+Architecture
+
+Each part of Motive has one job. The learned model ranks. Python code retrieves candidates and calculates scores. Claude interprets the request. Recorded evidence explains the result.
+
+Claude never chooses recommendation items. It only turns a sentence into structured fields. All retrieval and ranking happen in the local recommendation system.
+
+                     Natural-language request (optional)
+                                  │
+                                  ▼
+                        Claude intent parser
+                  (returns structured UserIntent only)
+                                  │
+Shopper ID ──► User routing       │
+                 │                │
+       ┌─────────┴─────────┐      │
+       ▼                   ▼      │
+   New user            Known user │
+       │                   │      │
+       ▼                   ▼      │
+  Weighted          Candidate generation
+  popularity        (content + co-visitation,
+       │             provenance recorded)
+       │                   │      │
+       │                   ▼      │
+       │           Tree reranker  │
+       │                   │      │
+       │                   ▼      ▼
+       │        Intent blend (85% learned, 15% intent)
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+     Evidence and grounded explanations
+                 │
+                 ▼
+         FastAPI ──► React UI
+Component	Handled by	Role
+User routing	Deterministic Python	Sends each shopper to cold-start or personalized logic
+Candidate retrieval	Python, NumPy, SciPy	Content neighbors and co-visitation neighbors
+Ranking	scikit-learn model	Orders candidates by predicted relevance
+Intent parsing	Claude	Converts free text into a structured UserIntent
+Intent blending	Deterministic Python	Applies supported preferences as a bounded adjustment
+Explanations	Deterministic Python	Built only from recorded evidence
+Dataset and Cold Start
+The Retailrocket Dataset
 	Approximate size
 Interaction rows	2.75 million
 Event types	view, add-to-cart, transaction
@@ -30,62 +90,78 @@ Products in interaction data	235,000
 Products with catalog metadata	400,000+
 Time span	May to September 2015
 
-The data is very sparse. Around 90% of September users have no history in the earlier training period, which makes them cold-start users.
+The dataset is anonymized. Products are numeric IDs, and most catalog properties are hashed. Real product names, brands, prices, specifications, retailer links, and product meaning are not reliably available.
 
-Architecture
-                      Natural-language request (optional)
-                                   │
-                                   ▼
-                        Claude intent parser
-                     (structured UserIntent only)
-                                   │
-Shopper ID ──► User routing ───────┼─────────────────────────────┐
-                 │                 │                             │
-     new user    │    known user   │                             │
-        ▼        ▼                 │                             │
-  Weighted    Candidate generation │                             │
-  popularity  (content + co-visit) │                             │
-        │        │                 │                             │
-        │        ▼                 │                             │
-        │   Tree reranker          │                             │
-        │        │                 ▼                             │
-        │        └──► Intent blend (85% learned / 15% intent)    │
-        │                          │                             │
-        └──────────────────────────┴──► Evidence + explanations ◄┘
-                                          │
-                                          ▼
-                                FastAPI ──► React UI
+This matters for anything the system says. If a shopper asks for "Sony headphones under $300 for travel," Motive can parse that into requested_brand = Sony, max_price = 300, and use_case = travel. It then marks all three as unverifiable. It will not claim that any result is a Sony product, costs under $300, or is suited to travel.
+
+For the same reason, the colored marks on recommendation cards are generated from item IDs. They are not product images.
+
 User Routing
-
-Shoppers are routed by how many items they have interacted with before:
-
 Segment	Historical items	Strategy
 New	0	Weighted catalog popularity
 Low-history	1 to 2	Personalized retrieval and reranking
 Established	3 or more	Personalized retrieval and reranking
+
+The data is very sparse. Around 90% of September users have no history in the earlier training period, so cold start is the common case, not an edge case.
+
 Cold Start
 
-New shoppers have no behavioral evidence, so they receive popularity-based recommendations. Popularity is weighted by interaction type: a view counts as 1, an add-to-cart as 3, and a transaction as 5.
+New shoppers have no behavioral evidence to work from, so they receive popularity-based recommendations. Popularity is weighted by how strong each interaction is:
 
-A new shopper's request is still parsed, but it does not currently change the popularity ordering. The UI states this directly so the shopper is not misled into thinking their request changed the results.
+Event	Weight
+View	1
+Add-to-cart	3
+Transaction	5
+
+A new shopper's request is still parsed, but it does not currently change the popularity ordering. The UI tells the shopper this directly rather than letting them assume their request had an effect.
 
 Candidate Generation
 
-For known shoppers, Motive builds a pool of roughly 200 candidates from two sources.
+Reranking can only reorder what retrieval finds, so candidate generation gets a lot of attention in Motive. Known shoppers get candidates from two independent sources.
 
-Content similarity. Each product's catalog metadata is converted into tokens that preserve which property each value came from. These form a sparse item-feature matrix of about 417,053 products, 161,379 features, and 22.5 million non-zero entries. Rows are normalized, so similarity between two items is a cosine-style score. For example, item 460429's closest neighbor is item 100656, with a similarity of about 0.92.
+Content Similarity
 
-Co-visitation. Items viewed by the same shopper within a single session (using a 30-minute inactivity boundary) are linked. The May to July build produced about 1.19 million sessions, of which 183,446 contained more than one item. These yielded 1.41 million directed item pairs covering 96,460 items.
+Each product's catalog metadata is turned into tokens that keep track of which property each value belongs to. This matters because two products sharing the value "5" means nothing unless it is the same property. The tokens form a sparse item-feature matrix:
 
-The two signals were kept separate on purpose. Across 100 sampled items, their top-50 neighbor lists shared a mean of about 1.92 items (median 1), with a mean Jaccard overlap of about 0.031. They capture different relationships, so combining them gives the reranker more to work with.
+	Approximate size
+Products	417,053
+Retained features	161,379
+Non-zero entries	22.5 million
 
-The final configuration uses up to 20 of a shopper's strongest history items, pulls 50 content neighbors and 50 co-visitation neighbors for each, removes items the shopper has already seen, and records exactly which history item produced each candidate. Popularity is used as a ranking feature but not as an extra candidate source for known shoppers.
+Rows are normalized, so the similarity between two items is a cosine-style score. For example, item 460429's close neighbor is item 100656, with a similarity of about 0.92. This is an internal score over catalog properties, not a percentage of real-world similarity.
 
-Reranker
+Behavioral Co-visitation
 
-Each candidate gets a feature vector built from its retrieval evidence, including content score, maximum content similarity, co-visitation score, the number of history items that support it through each signal, popularity (raw and log-scaled), the shopper's history size, and an established-user flag.
+Items that the same shopper viewed within a single session are linked. A session ends after 30 minutes of inactivity. The May to July build produced:
 
-A logistic regression reranker was tested first. The final model is scikit-learn's HistGradientBoostingClassifier:
+	Approximate count
+Sessions	1.19 million
+Usable multi-item sessions	183,446
+Directed item pairs	1.41 million
+Items with behavioral neighbors	96,460
+Why the Two Signals Stay Separate
+
+It would be simpler to merge them into one similarity score. Before deciding, I checked how much they overlap. Across 100 sampled items, the top-50 content neighbors and top-50 co-visitation neighbors shared a mean of about 1.92 items (median 1), with a mean Jaccard overlap of about 0.031.
+
+In other words, the two signals almost never agree. Catalog similarity captures what a product is. Co-visitation captures what shoppers actually browse together. Keeping them separate lets the reranker learn how much to trust each one, and lets explanations say which kind of evidence produced a result.
+
+Final Configuration
+
+For each known shopper, Motive takes up to 20 of their strongest history items, pulls 50 content neighbors and 50 co-visitation neighbors for each, and removes items the shopper has already seen. This yields roughly 200 candidates before reranking. The exact history item that produced each candidate is recorded at this stage.
+
+Popularity is used as a ranking feature for known shoppers, but not as an extra candidate source in the final configuration.
+
+Learned Reranking
+
+Each candidate gets a feature vector built from its retrieval evidence:
+
+Feature group	Features
+Content	content score, maximum content similarity, history support count, average content support, multiple-history support
+Co-visitation	co-visitation score, log co-visitation score, maximum co-visitation score, co-visitation support count, average co-visitation support, multiple co-visitation support
+Popularity	popularity score, log popularity
+Shopper	user history count, established-user flag
+
+A logistic regression reranker was tested first. The final model is scikit-learn's HistGradientBoostingClassifier, which handles non-linear interactions between these features, such as a candidate being supported by several history items through both signals at once.
 
 HistGradientBoostingClassifier(
     learning_rate=0.08,
@@ -97,36 +173,44 @@ HistGradientBoostingClassifier(
 )
 Natural-Language Intent
 
-Claude converts a free-text request into a structured UserIntent object. It does not see the catalog and does not choose, add, or remove recommendations. Claude never picks the items.
+Claude converts a free-text request into a structured UserIntent object. It does not see the catalog and does not choose, add, or remove recommendations.
 
-Four ranking preferences are supported and can affect ranking:
+Four ranking directions are supported and can affect ranking:
 
-familiar: closer to what the shopper has already viewed
-exploratory: further from the shopper's usual items
-popular: favors widely engaged items
-niche: favors less common items
+Direction	Meaning
+familiar	Closer to what the shopper has already interacted with
+exploratory	Further from the shopper's usual items
+popular	Favors widely engaged items
+niche	Favors less common items
 
-Other fields can be parsed but not verified against anonymized data: brand, minimum and maximum price, use case, priority features, and features to avoid. These are returned as unverifiable constraints and shown in the UI.
+Other fields can be parsed but not verified against anonymized data: brand, minimum price, maximum price, use case, priority features, and features to avoid. These are returned as unverifiable constraints and shown to the shopper.
 
-Blending Intent With the Learned Ranking
+How Intent Affects Ranking
 
-The learned ranking stays in charge. Supported intent is applied afterward as a limited adjustment:
+The learned reranker stays in charge. Supported intent is applied afterward as a limited adjustment:
 
-final score = 0.85 × normalized reranker score + 0.15 × normalized intent adjustment
+final_score = 0.85 * normalized_reranker_score
+            + 0.15 * normalized_intent_score
 
-An earlier version had a bug here. Raw tree probabilities were very small, while intent scores sat near a 0 to 1 range. Even with an 85/15 blend on paper, intent effectively replaced the model's ranking. I found this while testing explanations, because rank movements looked far larger than the weights should allow. The fix was to normalize both scores independently before blending.
+The 85/15 split is hand-selected. It was not learned, calibrated, or tuned as an optimal setting. It reflects a product decision that the shopper's request should nudge the ranking without overriding what the model learned from behavior.
 
-After the fix, intent nudges results rather than overriding them. In one test, item 323403 moved from rank 5 to rank 4, item 186360 moved from 4 to 5, and the top three learned results stayed in the top three.
+The Blending Bug
 
-The 85/15 split is a hand-picked product choice. It was not learned or tuned offline.
+The first version of this blend did not behave as intended. Raw tree probabilities were very small numbers, while intent scores sat roughly in a 0 to 1 range. So even though the weights said 85/15 on paper, intent was effectively deciding the ranking.
 
-Explainability
+I found this during explainability testing. Once explanations started reporting base rank and final rank side by side, the rank movements were clearly too large for a 15% adjustment. The fix was to normalize the reranker score and the intent score independently before blending.
 
-Early versions produced explanations like "This item is similar to products from your history." That told the shopper almost nothing, so candidate generation was changed to keep exact provenance through every stage.
+After the fix, intent nudges results instead of replacing them. In one test, item 323403 moved from rank 5 to rank 4, item 186360 moved from rank 4 to rank 5, and the top three learned results stayed in the top three.
 
-Each recommendation can now carry:
+Explainability and Provenance
 
-the exact history item that retrieved it, and that item's interaction weight
+Early versions produced explanations like "This item is similar to products from your history." That sentence is true for nearly every recommendation and tells the shopper nothing.
+
+Reconstructing better explanations after ranking would have meant guessing at what caused each result. Instead, candidate generation was changed to record provenance as candidates are created, so the evidence travels with each item through reranking and intent blending.
+
+Each recommendation can carry:
+
+the exact source history item and its interaction weight
 content similarity and its weighted contribution
 the co-visitation source item and score
 support counts for both signals
@@ -135,30 +219,40 @@ base score, base rank, final score, and final rank
 the intent adjustment
 any unverifiable constraints from the request
 
-Explanations are generated from this evidence. A real example:
+Explanations are built only from these fields. A real example:
 
 Item 323403 is most similar to item 72028 from your history with a catalog-property similarity of 0.70. It also has a session-based relationship with item 72028 with a co-visitation score of 2.00. Its popularity signal was 114. After applying the user's supported preferences, it moved from rank 5 to rank 4.
 
-A similarity of 0.70 is an internal score over catalog properties. It does not mean the products are "70% similar" in any real-world sense.
+The 0.70 here is an internal catalog-property similarity score. It does not mean the two products are "70% similar."
+
+Frontend
+
+The frontend is built with React and Vite and has four sections: Discover, System, Intent, and Trust.
+
+Discover is the main view. The shopper enters an ID, an optional request, and a result count, or picks a quick intent shortcut or a recent request. The page shows the shopper's segment, how the request was interpreted, and any constraints that could not be verified.
+
+Each recommendation card shows its ranking score and a grounded explanation. An evidence drawer opens the full record: the source history item, session support, popularity signal, intent adjustment, and base-to-final rank movement. A top-result comparison shows how the leading results differ.
 
 Evaluation
 
-Each result below applies to a specific group of users or test cases. Please read the population notes before comparing numbers across tables.
+Each result below applies to a specific population. The numbers in different tables are not directly comparable, and none of them is a single "accuracy" figure for the whole system.
 
 Candidate Retrieval
 
-Population: a prototype sample of validation users. Metric: the share of users whose candidate pool contained at least one item they interacted with in the future period.
+Population: a prototype sample of validation users.
+Metric: candidate hit rate, the share of users whose candidate pool contained at least one item they interacted with in the future period. This measures whether retrieval found anything relevant, not the quality of the final recommendations.
 
 Retrieval setup	Overall	Established	Low-history
 Basic content	~8%	~9%	~7%
 Deeper content	~10%	~12%	~8%
 Content + co-visitation	~13%	~15%	~11%
 
-Adding co-visitation gave the largest improvement, which is why it stayed in the final system. Even so, most users' candidate pools contain no future positive item. Retrieval is the main bottleneck in the system.
+Adding co-visitation gave the largest gain, which is why it stayed in the final system. Even so, most users' candidate pools contain no future positive item. Retrieval is the main bottleneck in Motive.
 
 Reranking
 
-Population: only the 54 validation users whose candidate pool already contained at least one future positive item. These numbers measure how well the reranker orders candidates once a correct answer is available. They are not full-system metrics.
+Population: only the 54 validation users whose candidate pool already contained at least one future positive item.
+What it measures: how well the reranker orders candidates once retrieval has succeeded. These are conditional metrics, not full-system metrics.
 
 Metric	Baseline	Tree reranker
 Precision@10	0.0481	0.0685
@@ -168,81 +262,42 @@ MRR	0.1674	0.2116
 NDCG	0.1658	0.2025
 ROC-AUC		0.7785
 
-The HitRate@10 of 0.4444 means that for 44% of these 54 users, a future positive appeared in the top 10. It does not mean Motive finds a relevant item for 44% of all users.
+A HitRate@10 of 0.4444 means that for 44.44% of these 54 users, a future positive appeared in the top 10. It does not mean Motive finds a relevant item for 44.44% of all users. For most users, retrieval never surfaced a positive item, so the reranker had nothing to promote.
 
 Intent Parsing
 
-Population: a frozen holdout of 26 natural-language requests, compared against a deterministic rule-based parser.
+Population: a frozen holdout of 26 natural-language requests.
+Baseline: a deterministic rule-based parser.
 
 Parser	Correct	Accuracy
 Rule-based baseline	12 / 26	46.15%
 Claude (Anthropic API)	25 / 26	96.15%
 
-All outputs passed schema validation. The one miss was "Keep choices pretty conventional," which was expected to map to a popularity preference, but Claude returned no popularity preference. With only 26 cases, this result shows the parser works well on the kinds of requests tested. It is not a general accuracy estimate.
+All outputs passed schema validation. The one miss was "Keep choices pretty conventional," which was expected to map to a popularity preference, but Claude returned no popularity preference.
 
-Frontend
+With only 26 cases, this shows the parser handles the kinds of requests tested. It is not an estimate of real-world accuracy across all possible requests.
 
-The frontend is built with React and Vite and has four sections: Discover, System, Intent, and Trust.
+Performance Engineering
 
-Discover is the main view. A shopper ID and an optional request produce ranked recommendation cards. The page shows the shopper's segment, how the request was interpreted, and any constraints that could not be verified. Each card shows its blended score and a grounded explanation, and an evidence drawer shows the source history item, session support, popularity signal, intent adjustment, and base-to-final rank movement. There are also recent directions, intent shortcuts, and a comparison of the top results.
+Evaluation for established shoppers became very slow at one point. Each of those shoppers could have up to 20 history items, and finding content neighbors for each one meant computing similarity against a catalog of over 400,000 products. Across many users, the same large scans were repeated again and again.
 
-API
-Method	Endpoint	Description
-GET	/health	Service health check
-GET	/recommend/{user_id}	Recommendations for a shopper without a request
-POST	/recommend/intelligent	Recommendations with a natural-language request
+The fixes were straightforward once the cause was clear:
 
-Interactive Swagger docs are available at /docs on the local backend when it is running.
+Fix	Why it helped
+Normalize the sparse item matrix once	Similarity becomes a single sparse dot product with no per-query normalization
+Dictionary item lookup	Item ID to row index becomes constant time
+np.argpartition	Finds the top neighbors without sorting the whole score array
+Content neighbor cache	Each item's neighbors are computed once and reused
+Cache pre-warming	Common items are loaded before evaluation starts
 
-The Anthropic API key is read on the server from the ANTHROPIC_API_KEY environment variable. It is never sent to the frontend or included in API responses.
+One evaluation run went from more than 14 minutes to roughly 5 seconds after these changes and cache warm-up. This was measured in my local project environment. It is not a formal production latency benchmark.
 
-Installation
-Prerequisites
-Python 3 with venv
-Node.js and npm
-Git LFS
-An Anthropic API key
-Setup
-
-Clone the repository and pull the runtime artifacts, which are stored with Git LFS:
-
-git lfs install
-git clone <repository-url>
-cd AI-Recomender-project
-git lfs pull
-
-Create a virtual environment and install the backend dependencies:
-
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-Set your Anthropic API key:
-
-export ANTHROPIC_API_KEY="your-key-here"     # Windows PowerShell: $env:ANTHROPIC_API_KEY="your-key-here"
-
-The Anthropic API key is read from the ANTHROPIC_API_KEY environment variable. Local .env files are ignored by Git so secrets are not committed.
-
-Install the frontend dependencies:
-
-cd frontend
-npm install
-cd ..
-Running Locally
-
-Start the backend from the project root:
-
-python -m uvicorn api.main:app --reload
-
-In a second terminal, start the frontend:
-
-cd frontend
-npm run dev
-
-Vite prints the local URL to open in your browser. Motive currently runs locally only. There is no public deployment.
-
-The runtime artifacts pulled through Git LFS are enough to run the application. The raw Retailrocket CSV files are not included in Git. You only need them if you want to rebuild the artifacts or retrain the reranker using the scripts in scripts/.
-
+Technology Stack
+Area	Technologies
+Backend and ML	Python, NumPy, Pandas, SciPy, scikit-learn, FastAPI, Pydantic, Uvicorn
+AI	Anthropic Claude for structured UserIntent parsing
+Frontend	React, Vite
+Testing and tooling	Pytest, Git, Git LFS
 Testing
 
 Motive has two layers of automated checks.
@@ -259,88 +314,157 @@ python -m scripts.regression_suite
 
 Current result: 158 / 158 checks passed.
 
-The regression suite checks product behavior end to end. It covers all three user segments, ranking with and without intent, familiar and popular requests, exploratory and niche requests, unsupported brand, price, and use-case constraints (alone and combined), result counts, duplicate prevention, provenance, co-visitation evidence, rank movement, limits on how far intent can move an item, grounded explanations, and deterministic output.
+The unit tests check that individual pieces work. The regression suite checks that the product behaves correctly end to end:
 
-Performance Notes
+Area	Covered cases
+Routing	cold-start, low-history, and established users
+Ranking	no-intent ranking, deterministic output, result counts, duplicate prevention
+Intent	familiar + popular, exploratory + niche, intent movement bounds, rank movement
+Unsupported constraints	brand, price, use case, and multiple constraints together
+Evidence	provenance, co-visitation evidence, grounded explanations
+Engineering Lessons
 
-Candidate evaluation was very slow at first. Established shoppers could trigger similarity calculations against the full catalog for each of their history items. The fixes were:
+Sparse data changes what a metric means. With around 90% of September users being cold-start, a single headline number would hide most of the story. Every metric in this project needed a stated population before it could be read correctly.
 
-normalizing the sparse item matrix once instead of per query
-using dictionary lookups for item indices
-using np.argpartition to find top neighbors without fully sorting
-caching and pre-warming content neighbors
+Retrieval matters more than reranking. A better reranker improved ordering for the 54 users where retrieval succeeded, but it cannot help anyone whose candidate pool has no relevant item. The largest remaining gains are in retrieval, not in the model.
 
-One evaluation run dropped from over 14 minutes to about 5 seconds after these changes and cache warm-up. This was measured in my local development environment and is not a formal benchmark.
+Two similarity signals are not automatically redundant. I expected content and co-visitation neighbors to overlap heavily. Measuring it showed they barely overlap at all, which changed the design from one merged score to two separate sources.
+
+Score blending needs matching scales. An 85/15 weighting means nothing if the two inputs live on different numeric ranges. Normalizing each score before blending was a small fix for a bug that silently changed the whole ranking.
+
+Explanation testing catches ranking bugs. The blending bug was not found by metrics. It was found because the explanations reported rank movement, and the movement looked wrong. Making the system explain itself also made it easier to check.
+
+Provenance should be recorded, not reconstructed. Trying to explain a result after ranking means guessing. Recording the source history item and scores at candidate generation made accurate explanations simple.
+
+Anonymized data sets hard limits on explanations. The system can only describe what the data supports. That is why explanations talk about item IDs and internal scores, and why brand and price requests are flagged instead of applied.
+
+The LLM should interpret, not decide. Keeping Claude limited to producing a validated UserIntent object means its output can be tested on its own, and the ranking stays reproducible and explainable.
+
+Tests should cover product behavior. Unit tests passing did not guarantee that, for example, an unsupported price request was flagged correctly. The regression suite exists to check those behaviors directly.
+
+Large artifacts and secrets need a plan from the start. Git LFS keeps model and matrix files out of normal Git history, and keeping the API key in an environment variable means it never has to touch the repository.
+
+Current Limitations
+Products are anonymized.
+Brands, product names, prices, specifications, and retailer links cannot be verified.
+Content metadata comes from the available snapshot, so content features are not perfectly time-separated from the evaluation period.
+Reranker metrics are conditional on successful candidate retrieval and do not describe the full system.
+Candidate recall is the main bottleneck.
+The 85/15 intent weighting is hand-selected, not learned or calibrated.
+Intent from new shoppers is parsed but does not currently change popularity ordering.
+The intent parser holdout contains only 26 examples.
+The full integrated system has not yet been rerun on the untouched September benchmark since the latest ranking, provenance, and intent changes.
+There is no live retailer integration.
+There is no live price retrieval.
+There is no semantic product search.
+The evaluation does not claim research-grade temporal purity.
+Future Improvements
+Stronger candidate retrieval, since it limits everything downstream.
+Sequential recommendation models that use the order of a shopper's actions.
+Richer behavioral modeling beyond session co-visitation.
+Learned intent weighting to replace the hand-selected 85/15 split.
+Richer, verified product metadata so constraints like brand and price can actually be checked.
+Stronger cold-start personalization, including letting intent affect new shoppers' results.
+A final evaluation of the integrated system on the untouched September data.
+
+None of these are implemented yet.
+
+Getting Started
+
+Motive currently runs locally. There is no public deployment.
+
+Prerequisites
+Python 3
+Node.js and npm
+Git LFS
+An Anthropic API key
+1. Clone the Repository
+
+Runtime artifacts are stored with Git LFS, so pull them after cloning:
+
+git lfs install
+git clone <repository-url>
+cd Motive
+git lfs pull
+2. Set Up the Backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+On Windows, activate the environment with .venv\Scripts\activate instead.
+
+3. Set the Anthropic API Key
+export ANTHROPIC_API_KEY="your-key-here"
+
+The key is read on the server from the ANTHROPIC_API_KEY environment variable. The frontend never has access to it, and it is not included in API responses.
+
+4. Start the Backend
+
+From the project root:
+
+python -m uvicorn api.main:app --reload
+5. Start the Frontend
+
+In a second terminal:
+
+cd frontend
+npm install
+npm run dev
+
+Vite prints the local URL to open in your browser.
+
+Runtime Artifacts
+
+The runtime artifacts pulled through Git LFS are enough to run the application:
+
+Artifact	Contents
+content_neighbors.pkl	Cached content neighbors
+item_ids.npy	Item IDs
+item_to_index.pkl	Item ID to matrix row mapping
+normalized_item_matrix.npz	Normalized sparse item-feature matrix
+reranker_covisitation.pkl	Co-visitation neighbors
+reranker_tree.pkl	Final tree reranker
+user_history_count.pkl	History counts per user
+user_item_strength.pkl	Weighted user-item interaction strength
+weighted_popularity.pkl	Weighted popularity scores
+
+The raw Retailrocket CSV files are not included in Git. They are only needed to rebuild artifacts or retrain the reranker. The training dataset (reranker_training_data.pkl) and the unused logistic reranker are also excluded.
+
+Secrets and Repository Hygiene
+
+Git ignores .env, the virtual environment, node_modules, the frontend build output, raw CSV datasets, and training-only artifacts. Local .env files are ignored so secrets are not committed. A scan of the staged repository before release found no sk-ant- key.
+
+API Reference
+Method	Endpoint	Description
+GET	/health	Service health check
+GET	/recommend/{user_id}	Recommendations for a shopper without a request
+POST	/recommend/intelligent	Recommendations with a natural-language request
+
+Interactive Swagger docs are available at /docs on the local backend while it is running.
 
 Project Structure
 Motive/
-├── api/
-│   └── main.py                  # FastAPI app and endpoints
-├── artifacts/                   # Runtime artifacts (Git LFS)
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   ├── hooks/
-│   │   ├── lib/
-│   │   └── services/
-│   └── package.json
-├── notebooks/                   # Exploration and analysis
-├── scripts/                     # Artifact building, training, evaluation, regression suite
-├── src/
-│   ├── candidates.py            # Candidate generation with provenance
-│   ├── content.py               # Content similarity
-│   ├── covisitation.py          # Session-based item relationships
-│   ├── evidence.py              # Evidence collection
-│   ├── explanations.py          # Grounded explanations
-│   ├── features.py              # Reranker features
-│   ├── intent.py                # UserIntent schema and parsing
-│   ├── intent_ranking.py        # Intent blending
-│   ├── popularity.py            # Weighted popularity
-│   ├── recommender.py           # Main recommendation pipeline
-│   ├── reranker.py              # Tree reranker
-│   ├── routing.py               # User segmentation
-│   ├── artifacts.py             # Artifact loading
-│   └── llm/                     # Anthropic client code
-├── tests/
+├── api/                # FastAPI app and endpoints
+├── artifacts/          # Runtime artifacts (Git LFS)
+├── frontend/           # React and Vite frontend
+├── notebooks/          # Exploration and analysis
+├── scripts/            # Artifact building, training, evaluation, regression suite
+├── src/                # Recommendation pipeline, intent, evidence, explanations
+├── tests/              # Unit and integration tests
+├── README.md
+├── requirements.txt
 ├── pytest.ini
 ├── .gitignore
 └── .gitattributes
+Project Status
 
-Runtime artifacts include content neighbors, item IDs and index mappings, the normalized item matrix, weighted popularity, user history counts, user-item strengths, co-visitation neighbors, and the final reranker. The training dataset (reranker_training_data.pkl), the unused logistic reranker, raw CSVs, the virtual environment, node_modules, and the frontend build output are excluded from Git.
-
-Limitations
-
-These are known limits of the current system and its evaluation.
-
-Anonymized products. Product names, brands, prices, specifications, and links are not available, so Motive cannot verify requests that depend on them.
-Metadata timing. Content features come from the available metadata snapshot, so the content evaluation is not strictly time-separated. The evaluation should not be read as having research-grade temporal purity.
-Conditional reranker metrics. The reranker results apply only to the 54 users whose candidate pool contained a future positive. They do not describe the whole system.
-Retrieval is the bottleneck. Most validation users' candidate pools contained no future positive item, so reranking cannot help them.
-Hand-set intent weight. The 85/15 blend was chosen manually and has not been learned or calibrated.
-Cold-start intent. Requests from new shoppers are parsed but do not change their popularity-based results.
-Small intent holdout. The parser evaluation uses 26 cases.
-Final benchmark pending. The full system has not yet been re-evaluated on the untouched September period since the latest ranking, provenance, and intent changes.
-Scope. Motive does not provide live cross-site recommendations, live prices, semantic product search, or integration with a real retailer.
-Future Work
-Improve candidate retrieval, since it limits everything downstream.
-Try sequential recommendation models that use the order of a shopper's actions.
-Learn the intent weighting instead of setting it by hand.
-Use richer, verified catalog metadata so constraints like brand and price can actually be checked.
-Personalize cold-start results, including letting intent change them.
-Run the final integrated system on the untouched September benchmark.
-Tech Stack
-Area	Technologies
-Backend and ML	Python, NumPy, Pandas, SciPy, scikit-learn, FastAPI, Pydantic, Anthropic API
-Frontend	React, Vite
-Testing and tooling	Pytest, Git LFS
-Current Status
-
-Motive runs end to end locally. At the time of writing:
+Motive runs end to end locally, and the code is on GitHub. At the time of writing:
 
 37 / 37 pytest tests pass
 158 / 158 regression checks pass
 the frontend production build succeeds
-live familiar + popular and exploratory + niche requests have been tested through the full stack
-the evidence UI has been checked manually
+the familiar + popular flow has been tested
+the exploratory + niche flow has been tested
+the evidence UI has been manually inspected
 
-The next major milestone is the final evaluation on the untouched September data.
+The next major milestone is a final integrated evaluation on the untouched September data.
